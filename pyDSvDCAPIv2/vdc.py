@@ -137,9 +137,13 @@ class VDC:
     def _schedule_save(self) -> None:
         data = self._build_state_dict()
         # Stage data synchronously so flush() can always find it,
-        # then schedule the debounced async write.
+        # then schedule the debounced async write (only when a loop is running).
         self._store.stage(data)
-        asyncio.create_task(self._store.schedule_save(data))
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(self._store.schedule_save(data))
+        except RuntimeError:
+            pass  # No event loop running; data is staged and will be written on flush()
 
     async def _connect_with_retry(self) -> None:
         while self._running:
@@ -182,7 +186,8 @@ class VDC:
         logger.warning("Disconnected from dSS — reconnecting in %.0fs", self._reconnect_delay)
         await asyncio.sleep(self._reconnect_delay)
         self._reconnect_delay = min(self._reconnect_delay * 2, _RECONNECT_MAX)
-        await self._connect_with_retry()
+        # Schedule reconnect as a new independent task to avoid unbounded coroutine chain
+        asyncio.create_task(self._connect_with_retry())
 
     async def _send_device_event(
         self, device: Device, event_type: EventType, attribute: str, value: str

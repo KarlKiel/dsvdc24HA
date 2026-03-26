@@ -62,11 +62,11 @@ class Scene:
     scene_id: str
     name: str = ""
     type: int = 0
-    attributes: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {"sceneId": self.scene_id, "name": self.name,
-                "type": self.type, "attributes": dict(self.attributes)}
+                "type": self.type, "metadata": dict(self.metadata)}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Scene:
@@ -74,7 +74,7 @@ class Scene:
             scene_id=data["sceneId"],
             name=data.get("name", ""),
             type=int(data.get("type", 0)),
-            attributes=dict(data.get("attributes", {})),
+            metadata=dict(data.get("metadata", {})),
         )
 
 

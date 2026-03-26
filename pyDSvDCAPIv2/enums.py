@@ -113,8 +113,5 @@ class CommandStatus(IntEnum):
 
 
 class SceneType(IntEnum):
-    GENERAL = 0
-    AWAY = 1
-    NIGHT = 2
-    VACATION = 3
-    CUSTOM = 4
+    DEFAULT = 0
+    CUSTOM = 1

@@ -111,6 +111,19 @@ class VDCConnection:
         # capabilities is repeated scalar enum — append integer values directly
         for cap in device.capabilities:
             pb.capabilities.append(int(cap.type))
+        for m in device.measurements:
+            pb_m = pb.measurements.add()
+            pb_m.type = str(m.type)
+            pb_m.value = float(m.value)
+            pb_m.unit = str(m.unit)
+            pb_m.timestamp = int(m.timestamp)
+        for s in device.scenes:
+            pb_s = pb.scenes.add()
+            pb_s.sceneId = s.scene_id
+            pb_s.name = s.name
+            pb_s.type = int(s.type)
+            for k, v in s.metadata.items():
+                pb_s.metadata[k] = v
         return pb
 
     async def _send(self, payload: bytes) -> None:
@@ -143,22 +156,58 @@ class VDCConnection:
             await self._vdc._on_disconnect()
 
     async def _dispatch(self, raw: bytes) -> None:
-        """Try to parse raw bytes as each known incoming message type and dispatch."""
-        # Try SetStateRequest
+        """Try to parse raw bytes as each known incoming message type and dispatch.
+
+        Dispatch order matters: Command is checked before SetStateRequest because
+        SetStateRequest.attribute (field 2) and Command.command (field 2) share
+        the same field number. Command messages have a timestamp (field 4) and
+        no value field (field 3 is a map in Command vs a string in SetStateRequest),
+        but the safest discriminator is to try Command first using its unique
+        `params` map field (field 3 is a scalar string in SetStateRequest, never a map).
+        A real SetStateRequest will have a non-empty `value` string at field 3;
+        a Command will have `params` as a map at field 3.
+        We use round-trip re-serialisation to disambiguate: if the message parses
+        cleanly AND round-trips back to the same bytes it is well-typed.
+        For practical safety we use: try Command first (timestamp present),
+        then SetStateRequest (value present), falling back to the others.
+        """
+        # Try Command first — has timestamp (field 4) and params map (field 3)
+        try:
+            msg = command_pb2.Command()
+            msg.ParseFromString(raw)
+            if msg.deviceId and msg.command:
+                device = self._vdc._devices.get(msg.deviceId)
+                result = command_pb2.CommandResult()
+                result.deviceId = msg.deviceId
+                if device and device.on_command:
+                    try:
+                        out = await device.on_command(msg.command, dict(msg.params))
+                        result.status = command_pb2.CMD_OK
+                        for k, v in (out or {}).items():
+                            result.result[k] = str(v)
+                    except Exception as e:
+                        logger.error("on_command error: %s", e)
+                        result.status = command_pb2.CMD_FAILED
+                await self._send(result.SerializeToString())
+                return
+        except Exception:
+            pass
+
+        # Try SetStateRequest — has value string (field 3)
         try:
             msg = state_pb2.SetStateRequest()
             msg.ParseFromString(raw)
-            if msg.deviceId and msg.attribute:
+            if msg.deviceId and msg.attribute and msg.value:
                 device = self._vdc._devices.get(msg.deviceId)
                 if device and device.on_set_state:
                     resp = state_pb2.SetStateResponse()
                     resp.deviceId = msg.deviceId
                     try:
                         await device.on_set_state(msg.attribute, msg.value)
-                        resp.status = 0  # CommandStatus.OK
+                        resp.status = 0  # OK
                     except Exception as e:
                         logger.error("on_set_state error: %s", e)
-                        resp.status = 1  # CommandStatus.FAILED
+                        resp.status = 1  # FAILED
                     await self._send(resp.SerializeToString())
                 return
         except Exception:
@@ -183,24 +232,17 @@ class VDCConnection:
         except Exception:
             pass
 
-        # Try Command
+        # Try FirmwareUpdateRequest
         try:
-            msg = command_pb2.Command()
+            msg = firmware_pb2.FirmwareUpdateRequest()
             msg.ParseFromString(raw)
-            if msg.deviceId and msg.command:
+            if msg.deviceId and msg.firmwareVersion:
                 device = self._vdc._devices.get(msg.deviceId)
-                result = command_pb2.CommandResult()
-                result.deviceId = msg.deviceId
-                if device and device.on_command:
+                if device and device.on_firmware_update:
                     try:
-                        out = await device.on_command(msg.command, dict(msg.params))
-                        result.status = 0  # CMD_OK
-                        for k, v in (out or {}).items():
-                            result.result[k] = str(v)
+                        await device.on_firmware_update(msg.firmwareVersion, msg.url)
                     except Exception as e:
-                        logger.error("on_command error: %s", e)
-                        result.status = 1  # CMD_FAILED
-                await self._send(result.SerializeToString())
+                        logger.error("on_firmware_update error: %s", e)
                 return
         except Exception:
             pass

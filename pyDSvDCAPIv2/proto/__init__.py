@@ -7,4 +7,4 @@ import os as _os
 # so the proto directory must be on sys.path.
 _proto_dir = _os.path.dirname(__file__)
 if _proto_dir not in _sys.path:
-    _sys.path.insert(0, _proto_dir)
+    _sys.path.append(_proto_dir)
