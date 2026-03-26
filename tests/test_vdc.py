@@ -2,7 +2,7 @@
 import asyncio
 import struct
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from pyDSvDCAPIv2.vdc import VDC
 from pyDSvDCAPIv2.device import Device
 from pyDSvDCAPIv2.enums import DeviceType, DeviceClass, DeviceStatus, VdcCapabilityFlag
@@ -61,9 +61,10 @@ async def test_start_connects_and_announces(vdc, device, tmp_path):
         reader = asyncio.StreamReader()
         # Feed the ack immediately
         reader.feed_data(ack_bytes)
-        writer = AsyncMock()
+        writer = MagicMock()
+        writer.write = MagicMock()
         writer.drain = AsyncMock()
-        writer.close = AsyncMock()
+        writer.close = MagicMock()
         writer.wait_closed = AsyncMock()
         return reader, writer
 
@@ -83,9 +84,10 @@ async def test_state_is_persisted_after_device_update(vdc, device, tmp_path):
     async def mock_open_connection(host, port):
         reader = asyncio.StreamReader()
         reader.feed_data(_framed(ack))
-        writer = AsyncMock()
+        writer = MagicMock()
+        writer.write = MagicMock()
         writer.drain = AsyncMock()
-        writer.close = AsyncMock()
+        writer.close = MagicMock()
         writer.wait_closed = AsyncMock()
         return reader, writer
 
