@@ -10,14 +10,15 @@
 
 A Python library that implements the digitalSTROM Virtual Device Connector (VDC) API v2, allowing users to easily create a fully working Python-based VDC that manages virtual devices over their complete lifecycle. The library provides:
 
-- A gRPC client connecting to the digitalSTROM Server (dSS)
+- A TCP client connecting to the digitalSTROM Server (dSS), sending/receiving length-prefixed protobuf messages
+- An optional WebSocket client for real-time event streaming
 - Device announcement, update, and removal lifecycle
 - Incoming command/state handling via async callbacks
 - YAML-based persistence with backup/restore
 - Automatic reconnection with full re-announcement
 - Periodic heartbeat keepalive
 
-**Not in scope:** The library does not implement a gRPC server. It is purely a client that connects to dSS.
+**Not in scope:** The library does not implement a gRPC server or client. The proto files are used only for message serialization.
 
 ---
 
@@ -27,9 +28,42 @@ The API v2 specification is at:
 `C:\Users\I064071\VSC-projects\vdc2documentation\digitalstrom4HA\vdc_documentation\derivedProtoFiles\`
 
 Key facts:
-- **Transport:** gRPC (primary), proto3, package `digitalstrom.vdc.api.v2`
-- **Connection direction:** VDC connects *to* dSS (default port 62000)
-- **Completely incompatible with v1** — v1 uses a single TCP socket with a custom property-tree protobuf; v2 uses proper gRPC with well-typed messages
+- **Transport:** Raw protobuf over TCP with 4-byte big-endian length prefix (NOT gRPC over HTTP/2)
+- **Connection direction:** VDC connects *to* dSS (default port 62000). dSS is the TCP server, VDC is the TCP client.
+- **WebSocket:** Optional secondary channel. After TCP handshake, if VDC announces `ws=1` and `ws-path=/vdc/ws`, the dSS may use a separate WebSocket connection for real-time event push. The VDC also connects to this WebSocket endpoint as a client.
+- **Proto files:** Define message structures only. The `service VdcService` block in `vdc_service.proto` is a formal API contract for documentation and code generation — it does NOT imply gRPC runtime usage.
+- **Completely incompatible with v1** — v1 uses a custom property-tree protobuf envelope; v2 uses well-typed individual messages with the same length-prefix framing.
+
+### Wire format
+```
+┌─────────────────────────────────────────┐
+│  4 bytes: message length (big-endian)   │
+│  N bytes: serialized protobuf message   │
+└─────────────────────────────────────────┘
+```
+
+### Connection sequence
+```
+VDC (TCP client)                       dSS (TCP server, port 62000)
+ │                                          │
+ │──── TCP connect ──────────────────────►  │
+ │── ServiceAnnouncement (len-prefixed) ──► │  "I'm vdc-001, version 1.0, caps=[SCENES]"
+ │◄── ServiceAcknowledgement ────────────── │  "OK, protocol accepted, session=token"
+ │── DeviceAnnouncement ──────────────────► │  "device lamp-001, LIGHT/LIGHTING, ONLINE"
+ │── DeviceAnnouncement ──────────────────► │  "device sensor-001, SENSOR/SENSOR, ONLINE"
+ │                                          │
+ │◄── SetDeviceState ──────────────────────  │  "set lamp-001 brightness=50"
+ │── SetStateResponse ────────────────────► │  "OK"
+ │◄── SendCommand ─────────────────────────  │  "lamp-001: SWITCH_OFF"
+ │── CommandResult ───────────────────────► │  "SUCCESS"
+ │                                          │
+ │── Heartbeat ───────────────────────────► │  every 30s
+ │◄── Heartbeat ───────────────────────────  │  acknowledged
+ │                                          │
+ │  [optional WebSocket channel]            │
+ │──── WS connect to dSS /vdc/ws ────────►  │
+ │◄── DeviceEvent stream ──────────────────  │  real-time events pushed by dSS
+```
 
 ---
 
@@ -42,13 +76,14 @@ pyDSvDCAPIv2/
 │   ├── vdc.py                   # VDC class — top-level entry point
 │   ├── device.py                # Device class — thin wrapper around DeviceAnnouncement
 │   ├── dsuid.py                 # dSUID-conformant ID generation (UUID v5, namespaced)
-│   ├── connection.py            # gRPC channel, stub calls, reconnect loop
+│   ├── connection.py            # TCP connection, length-prefix framing, reconnect loop
+│   ├── ws_client.py             # Optional WebSocket event channel
 │   ├── heartbeat.py             # Periodic heartbeat asyncio task
 │   ├── persistence.py           # YAML load/save with atomic write + .bak backup
-│   ├── enums.py                 # Python enums re-exporting proto enum values
+│   ├── enums.py                 # Python IntEnums matching proto enum values
 │   ├── exceptions.py            # VDCConnectionError, DeviceError
 │   └── proto/
-│       └── *_pb2*.py            # Pre-generated gRPC stubs (committed to repo)
+│       └── *_pb2.py             # Pre-generated protobuf message classes (committed to repo)
 ├── examples/
 │   └── simple_light.py          # Minimal working example
 ├── tests/
@@ -56,7 +91,7 @@ pyDSvDCAPIv2/
 └── README.md
 ```
 
-**Proto files** (`.proto` sources) are excluded from the repo via `.gitignore`. Only the generated `*_pb2.py` stubs are committed. The proto sources live at the reference location above.
+**Proto files** (`.proto` sources) are excluded from the repo via `.gitignore`. Only the generated `*_pb2.py` message classes are committed. The `_pb2_grpc.py` stub files are NOT generated or used.
 
 ---
 
@@ -69,32 +104,32 @@ vdc = VDC(
     vdc_id="my-vdc-001",          # seed for dSUID generation; actual dSUID stored in YAML
     name="My Home Bridge",
     version="1.0.0",
-    server_host="192.168.1.10",
-    server_port=62000,
-    capabilities=[VdcCapability.SCENES, VdcCapability.DYNAMIC_DEVICES],
+    server_host="192.168.1.10",   # dSS host
+    server_port=62000,            # dSS TCP port (default 62000)
+    capabilities=[VdcCapabilityFlag.SCENES, VdcCapabilityFlag.DYNAMIC_DEVICES],
     state_path="state.yaml",
-    heartbeat_interval=30,         # seconds, default 30
+    heartbeat_interval=30,        # seconds, default 30
+    ws_path="/vdc/ws",            # optional WebSocket path; None to disable
 )
 
 vdc.add_device(device)
-vdc.remove_device(device_id)      # removes from registry; sends DeviceRemoval if connected
+vdc.remove_device(device_id)     # removes from registry; sends DeviceRemoval if connected
 
-await vdc.start()                  # connect, announce, start background tasks
-await vdc.stop()                   # graceful shutdown
-await vdc.flush()                  # force immediate YAML save
+await vdc.start()                 # connect, announce, register devices, start background tasks
+await vdc.stop()                  # graceful shutdown
+await vdc.flush()                 # force immediate YAML save
 
-# VDC-level event callbacks:
-vdc.on_device_event = async_callback   # (DeviceEvent) from StreamDeviceEvents
-vdc.on_scene_event  = async_callback   # (SceneEvent) from StreamSceneEvents
+# VDC-level incoming callbacks:
+vdc.on_scene_event = async_callback    # called when dSS sends SceneActivation
 ```
 
 On `start()`:
-1. Load YAML state (restore vdc_id and devices)
-2. Open gRPC channel
-3. Call `Announce()` — send `ServiceAnnouncement`, receive `ServiceAcknowledgement`
-4. Call `RegisterDevice()` stream — send `DeviceAnnouncement` for each device
-5. Start `StreamDeviceEvents()` background task
-6. Start `StreamSceneEvents()` background task
+1. Load YAML state (restore resolved vdc_id and device IDs)
+2. Open TCP connection to dSS
+3. Send `ServiceAnnouncement`, receive `ServiceAcknowledgement` (or raise `VDCConnectionError`)
+4. Send `DeviceAnnouncement` for each registered device
+5. Start incoming message dispatch loop (background task)
+6. Optionally connect WebSocket to dSS event channel
 7. Start heartbeat background task
 
 ---
@@ -105,12 +140,12 @@ Thin wrapper matching the `DeviceAnnouncement` proto exactly.
 
 ```python
 device = Device(
-    device_id="lamp-001",          # seed for dSUID; actual dSUID stored in YAML
+    device_id="lamp-001",         # seed for dSUID; actual dSUID stored in YAML
     type=DeviceType.LIGHT,
     class_=DeviceClass.LIGHTING,
     name="Kitchen Light",
     status=DeviceStatus.ONLINE,
-    capabilities=[VdcCapability(type=CapabilityType.DIMMING)],
+    capabilities=[VdcCapability(type=CapabilityType.DIMMING, parameters={"minLevel": "0", "maxLevel": "100"})],
     config={"address": "110120301A1A", "model": "dS21-400"},
     attributes={},
     metadata={},
@@ -118,22 +153,22 @@ device = Device(
     scenes=[],
 )
 
-# Incoming callbacks (called by library when dSS sends a message for this device):
+# Incoming callbacks (called by library when dSS sends a message targeting this device):
 device.on_set_state = async def(attribute: str, value: str) -> None
 device.on_get_state = async def(attribute: str) -> str
 device.on_command   = async def(command: str, params: dict) -> dict
 device.on_scene     = async def(scene_id: str, action: Action, params: dict) -> None
 
-# Outgoing — push state/events to dSS:
-await device.update_state("brightness", "75")   # updates local state dict + triggers auto-save
-                                                 # NOTE: does NOT send SetStateRequest to dSS;
-                                                 # SetStateRequest flows dSS→VDC (via on_set_state)
-await device.send_event(                         # sends DeviceEvent via StreamDeviceEvents
+# Outgoing — update local state and push events to dSS:
+await device.update_state("brightness", "75")  # updates local state dict + auto-save
+                                                # NOTE: SetStateRequest flows dSS→VDC only;
+                                                # VDC pushes unsolicited changes via send_event()
+await device.send_event(
     EventType.VALUE_REPORTED,
     attribute="brightness",
     value="75"
 )
-await device.remove()                            # sends DeviceRemoval, removes from VDC
+await device.remove()                           # sends DeviceRemoval, removes from VDC
 ```
 
 Devices hold a `state: dict[str, str]` — the last-known attribute values. This is persisted to YAML and restored on startup.
@@ -145,9 +180,9 @@ Devices hold a `state: dict[str, str]` — the last-known attribute values. This
 IDs are generated deterministically using UUID v5 (name-based SHA-1) within fixed namespaces, formatted as a 17-byte (34 hex char) dSUID string — matching the digitalSTROM ecosystem convention.
 
 ```python
-# Namespaces (fixed UUIDs, one per entity type):
-VDC_NAMESPACE    = UUID("...")
-DEVICE_NAMESPACE = UUID("...")
+# Fixed namespaces (stable UUID constants):
+VDC_NAMESPACE    = UUID("2a4b5d8e-...")
+DEVICE_NAMESPACE = UUID("7c1f3a9b-...")
 
 class DsUid:
     @staticmethod
@@ -160,17 +195,17 @@ class DsUid:
 ```
 
 On first `VDC.start()`:
-- If `state.yaml` exists and contains a `vdc_id`, use that (stable across restarts)
-- Otherwise generate from the seed, save to YAML
+- If `state.yaml` exists and contains a resolved `vdc_id`, reuse it (stable across restarts)
+- Otherwise generate from the user-provided seed string, save to YAML
 
-Same logic for each `Device.device_id`.
+Same logic applies for each `Device.device_id`.
 
 ---
 
 ## 7. Persistence (`persistence.py`)
 
 **What is persisted:**
-- VDC: `vdc_id` (resolved dSUID), `name`, `version`, `server_host`, `server_port`, `capabilities`
+- VDC: resolved `vdc_id` (dSUID hex), `name`, `version`, `server_host`, `server_port`, `capabilities`
 - Each device: all `DeviceAnnouncement` fields + `state` dict (last-known attribute values)
 
 **YAML structure:**
@@ -184,7 +219,7 @@ vdc:
   capabilities: [0, 4]
 
 devices:
-  - device_id: "0101020304050607080910111213141516"
+  - device_id: "0201020304050607080910111213141516"
     type: 0
     class_: 0
     name: "Kitchen Light"
@@ -194,7 +229,9 @@ devices:
       model: "dS21-400"
     capabilities:
       - type: 1
-        parameters: {}
+        parameters:
+          minLevel: "0"
+          maxLevel: "100"
     metadata: {}
     attributes: {}
     measurements: []
@@ -220,49 +257,70 @@ devices:
 
 ## 8. Connection Management (`connection.py`)
 
-Owns the gRPC channel and all stub calls. Implements reconnect loop.
+Owns the TCP connection and length-prefix framing. Implements reconnect loop.
+
+**Message framing:**
+- Send: serialize protobuf → prepend 4-byte big-endian length → write to socket
+- Receive: read 4-byte length → read exactly that many bytes → deserialize protobuf
+
+**Incoming message dispatch:**
+- Single asyncio read loop receives all messages from dSS
+- Dispatches by message type to the appropriate device callback or VDC-level handler:
+  - `SetStateRequest` → find device by `deviceId` → call `device.on_set_state`
+  - `StateRequest` → find device by `deviceId` → call `device.on_get_state`
+  - `Command` → find device by `deviceId` → call `device.on_command`
+  - `SceneActivation` → call `vdc.on_scene_event`
+  - `FirmwareUpdateRequest` → find device → call `device.on_firmware_update` (if set)
+  - `Heartbeat` → echo back immediately
 
 **Reconnect strategy:** exponential backoff starting at 2s, doubling each attempt, capped at 60s.
 
 **On disconnect/error:**
-1. Cancel all background tasks (heartbeat, event streams)
+1. Cancel all background tasks (heartbeat, WS client)
 2. Wait backoff delay
-3. Re-open gRPC channel
-4. Re-run full announce + register sequence
+3. Re-open TCP connection
+4. Re-run full announce + device registration sequence
 5. Restart background tasks
-
-**Background tasks (all asyncio tasks):**
-- `StreamDeviceEvents` listener → dispatches to `device.on_command`, `device.on_set_state`, `device.on_get_state`, `device.on_scene` per device_id
-- `StreamSceneEvents` listener → dispatches to `vdc.on_scene_event`
-- Heartbeat loop
 
 ---
 
-## 9. Heartbeat (`heartbeat.py`)
+## 9. WebSocket Event Channel (`ws_client.py`)
+
+Optional secondary channel. Activated if `ws_path` is set on `VDC` and dSS accepts it
+(i.e. `ServiceAcknowledgement.options["upgrade"] == "websocket"`).
+
+- VDC connects as WebSocket client to `ws://{server_host}:{server_port}{ws_path}`
+- Receives `DeviceEvent` messages pushed by dSS
+- Dispatches to `device.on_set_state` / `device.on_command` etc. same as TCP channel
+- Auto-reconnects independently if WebSocket drops
+
+---
+
+## 10. Heartbeat (`heartbeat.py`)
 
 Simple asyncio loop:
 ```python
 while running:
-    await stub.Heartbeat(Heartbeat(vdc_id=vdc_id, timestamp=now_ms()))
+    send(Heartbeat(vdc_id=vdc_id, timestamp=now_ms(), metrics=vdc.heartbeat_metrics))
     await asyncio.sleep(interval)
 ```
 
-Optional `metrics` map can be populated by the user via `vdc.heartbeat_metrics: dict`.
+Optional `metrics` map populated by the user via `vdc.heartbeat_metrics: dict[str, str]`.
 
 ---
 
-## 10. Error Handling
+## 11. Error Handling
 
-- `VDCConnectionError` — raised from `start()` if handshake fails (auth rejected, version mismatch)
+- `VDCConnectionError` — raised from `start()` if handshake fails (e.g. `ServiceAcknowledgement` contains error)
 - `DeviceError` — raised if `SetStateResponse` or `CommandResult` returns non-OK status
-- gRPC transport errors → logged + trigger reconnect loop (never propagated to user)
+- TCP/socket errors → logged + trigger reconnect loop (never propagated to user)
 - User callback exceptions → logged, do not crash the VDC
 
 ---
 
-## 11. Enums (`enums.py`)
+## 12. Enums (`enums.py`)
 
-Python `IntEnum` classes wrapping proto enum values, so users never need to import from `_pb2` directly:
+Python `IntEnum` classes matching proto enum values exactly, so users never import from `_pb2` directly:
 
 ```python
 class DeviceType(IntEnum):
@@ -283,12 +341,18 @@ class CapabilityType(IntEnum):
     OPEN_CLOSE = 6; LOCK_UNLOCK = 7; GENERIC = 8
 
 class VdcCapabilityFlag(IntEnum):
-    SCENES = 0; SENSOR_EVENTS = 1; OTA_UPDATE = 2
-    DYNAMIC_DEVICES = 4; POWER_METERING = 9  # etc.
+    SCENES = 0; SENSOR_EVENTS = 1; OTA_UPDATE = 2; ADVANCED_ERROR = 3
+    DYNAMIC_DEVICES = 4; CUSTOM_METADATA = 5; MULTI_USER = 6
+    LOCALIZATION = 7; SECURE_AUTH = 8; POWER_METERING = 9
+    INTERLOCK = 10; TIMERS = 11; REMOVABLE = 12; ALERTS = 13
+    FIRMWARE_VERSIONING = 14; SCENE_TRANSITIONS = 15
+    PROTOCOL_VERSIONS = 16; BATCH_COMMANDS = 17; STATISTICS = 18
 
 class MeasurementType(IntEnum):
     TEMPERATURE = 0; HUMIDITY = 1; BRIGHTNESS = 2; CO2 = 3
-    POWER = 4; CURRENT = 5; VOLTAGE = 6; ENERGY = 7  # etc.
+    POWER = 4; CURRENT = 5; VOLTAGE = 6; ENERGY = 7
+    FREQUENCY = 8; PRESSURE = 9; WINDSPEED = 10; WINDDIRECTION = 11
+    RAIN = 12; UV_INDEX = 13; ILLUMINANCE = 14; GENERIC = 15
 
 class EventType(IntEnum):
     STATE_CHANGED = 0; VALUE_REPORTED = 1; TRIGGER = 2
@@ -296,50 +360,58 @@ class EventType(IntEnum):
 class ErrorCode(IntEnum):
     UNKNOWN = 0; PROTOCOL_ERROR = 1; TIMEOUT = 2
     NOT_SUPPORTED = 3; BAD_REQUEST = 4; AUTH_FAILED = 5
-    PERMISSION_DENIED = 6; DEVICE_UNAVAILABLE = 7
-    TEMPORARILY_UNAVAILABLE = 8
+    PERMISSION_DENIED = 6; DEVICE_UNAVAILABLE = 7; TEMPORARILY_UNAVAILABLE = 8
 
 class Action(IntEnum):
     ACTIVATE = 0; DEACTIVATE = 1
+
+class CommandStatus(IntEnum):
+    OK = 0; FAILED = 1; QUEUED = 2
+
+class SceneType(IntEnum):
+    GENERAL = 0; AWAY = 1; NIGHT = 2; VACATION = 3; CUSTOM = 4
 ```
 
 ---
 
-## 12. Dependencies
+## 13. Dependencies
 
 ```toml
 [project]
 dependencies = [
-    "grpcio>=1.50",
-    "grpcio-tools>=1.50",   # dev only, for stub regeneration
-    "pyyaml>=6.0",
     "protobuf>=4.0",
+    "pyyaml>=6.0",
+    "websockets>=11.0",
+    "zeroconf>=0.80.0",    # optional: for mDNS-based dSS discovery
 ]
 ```
 
+No `grpcio` dependency. Proto stubs generated with `protoc --python_out` only (no `--grpc_out`).
+
 ---
 
-## 13. Public API Surface (`__init__.py`)
+## 14. Public API Surface (`__init__.py`)
 
 ```python
 from pyDSvDCAPIv2 import (
     VDC,
     Device,
+    VdcCapability,
     DsUid,
     DeviceType, DeviceClass, DeviceStatus,
     CapabilityType, VdcCapabilityFlag,
     MeasurementType, EventType, Action,
-    ErrorCode,
+    CommandStatus, SceneType, ErrorCode,
     VDCConnectionError, DeviceError,
 )
 ```
 
 ---
 
-## 14. Testing Strategy
+## 15. Testing Strategy
 
-- Unit tests for `persistence.py` (load/save/backup/restore)
-- Unit tests for `dsuid.py` (deterministic ID generation)
-- Unit tests for `enums.py` (value correctness)
-- Integration tests using a gRPC mock server (via `grpc.experimental.aio` test utilities)
+- Unit tests for `persistence.py` (load/save/backup/restore/atomic write)
+- Unit tests for `dsuid.py` (deterministic, stable ID generation)
+- Unit tests for `connection.py` (length-prefix framing, message dispatch)
+- Integration tests using a mock TCP server that speaks the length-prefix protocol
 - Example in `examples/simple_light.py` as a smoke test against a real dSS
