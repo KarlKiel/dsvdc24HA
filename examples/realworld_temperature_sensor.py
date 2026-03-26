@@ -1,16 +1,18 @@
 # examples/realworld_temperature_sensor.py
 """
-Real-world example: temperature sensor VDC with zeroconf announcement.
+Real-world example: temperature sensor VDC.
+
+The VDC API v2 does NOT use zeroconf — the VDC connects out to the dSS
+directly (TCP client on port 62000). Zeroconf is a v1 concept.
 
 Features:
 - Asks for dSS host/port at startup
 - Derives VDC dSUID from host MAC address (stable across restarts)
-- Announces VDC via zeroconf (_ds-vdc._tcp.local.) with dSUID TXT record
 - Connects to dSS, announces a temperature sensor device
 - Generates randomly changing temperature values every 5 seconds
 - Console menu:
     [R] Restart — stops VDC, waits 5s, restarts from YAML (tests reconnect)
-    [Q] Quit clean — removes devices from dSS, deletes YAML, unregisters zeroconf
+    [Q] Quit clean — removes devices from dSS, deletes YAML, shuts down
 """
 import asyncio
 import glob
@@ -19,9 +21,6 @@ import os
 import random
 import sys
 import uuid
-
-from zeroconf import ServiceInfo
-from zeroconf.asyncio import AsyncZeroconf
 
 from pyDSvDCAPIv2 import (
     VDC, Device, VdcCapability, Measurement,
@@ -36,8 +35,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("realworld_temp")
 
-VDC_SERVICE_TYPE = "_ds-vdc._tcp.local."
 STATE_PATH = "realworld_temp_state.yaml"
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -45,11 +44,6 @@ def get_mac_address() -> str:
     """Return host MAC address as a hex string (no separators)."""
     mac = uuid.getnode()
     return f"{mac:012x}"
-
-
-def mac_to_vdc_id(mac_hex: str) -> str:
-    """Derive a stable dSUID from the host MAC address."""
-    return DsUid.for_vdc(mac_hex)
 
 
 def ask(prompt: str, default: str) -> str:
@@ -60,40 +54,10 @@ def ask(prompt: str, default: str) -> str:
         return default
 
 
-# ── zeroconf ─────────────────────────────────────────────────────────────────
-
-async def register_zeroconf(vdc_id: str, port: int) -> AsyncZeroconf:
-    """Register the VDC service via zeroconf and return the AsyncZeroconf instance."""
-    import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-
-    service_name = f"pyVDC-TempSensor.{VDC_SERVICE_TYPE}"
-    info = ServiceInfo(
-        type_=VDC_SERVICE_TYPE,
-        name=service_name,
-        port=port,
-        addresses=[socket.inet_aton(local_ip)],
-        properties={"dSUID": vdc_id},
-        server=f"{hostname}.local.",
-    )
-
-    zc = AsyncZeroconf()
-    await zc.async_register_service(info)
-    logger.info("Zeroconf registered: %s  dSUID=%s  addr=%s:%d", service_name, vdc_id, local_ip, port)
-    return zc, info
-
-
-async def unregister_zeroconf(zc: AsyncZeroconf, info: ServiceInfo) -> None:
-    await zc.async_unregister_service(info)
-    await zc.async_close()
-    logger.info("Zeroconf unregistered")
-
-
 # ── temperature loop ──────────────────────────────────────────────────────────
 
 async def temperature_loop(sensor: Device, stop_event: asyncio.Event) -> None:
-    """Generate random temperature values and report STATE_CHANGED events."""
+    """Generate random temperature values and report VALUE_REPORTED events."""
     temperature = round(random.uniform(20.0, 22.0), 1)
     while not stop_event.is_set():
         # Random walk ±0.5°C, clamped to 18–26°C
@@ -101,13 +65,12 @@ async def temperature_loop(sensor: Device, stop_event: asyncio.Event) -> None:
             max(18.0, min(26.0, temperature + random.uniform(-0.5, 0.5))), 1
         )
         sensor.update_state("temperature", str(temperature))
-        # Update measurement value for re-announcement
         if sensor.measurements:
             sensor.measurements[0].value = temperature
 
         print(f"  [temp] {temperature}°C")
         try:
-            await device_event_safe(sensor, temperature)
+            await sensor.send_event(EventType.VALUE_REPORTED, "temperature", str(temperature))
         except Exception as e:
             logger.warning("Failed to send temperature event: %s", e)
 
@@ -115,10 +78,6 @@ async def temperature_loop(sensor: Device, stop_event: asyncio.Event) -> None:
             await asyncio.wait_for(stop_event.wait(), timeout=5.0)
         except asyncio.TimeoutError:
             pass
-
-
-async def device_event_safe(sensor: Device, temperature: float) -> None:
-    await sensor.send_event(EventType.VALUE_REPORTED, "temperature", str(temperature))
 
 
 # ── VDC factory ──────────────────────────────────────────────────────────────
@@ -173,11 +132,8 @@ async def console_menu(
     dss_host: str,
     dss_port: int,
     vdc: VDC,
-    sensor: Device,
-    zc: AsyncZeroconf,
-    zc_info: ServiceInfo,
     stop_temp: asyncio.Event,
-) -> None:
+) -> tuple:
     """Run the interactive console menu in a thread-executor loop."""
     loop = asyncio.get_running_loop()
 
@@ -198,22 +154,15 @@ async def console_menu(
 
             print("Restarting VDC from saved state...")
             new_vdc, new_sensor = build_vdc(vdc_id, dss_host, dss_port)
-
-            # Replace references in outer scope via nonlocal-style reassignment
-            # (we return them so the caller can use the new objects)
             return "restart", new_vdc, new_sensor
 
         elif choice == "Q":
             print("\nRemoving devices from dSS...")
             stop_temp.set()
-            # Remove all devices cleanly
             for device in list(vdc._devices.values()):
                 await vdc.remove_device(device.device_id)
-            await asyncio.sleep(0.5)  # give dSS time to process removal
+            await asyncio.sleep(0.5)
             await vdc.stop()
-
-            print("Unregistering zeroconf...")
-            await unregister_zeroconf(zc, zc_info)
 
             print("Deleting state files...")
             delete_state_files()
@@ -231,11 +180,9 @@ async def run() -> None:
     dss_port = int(ask("dSS port", "62000"))
 
     mac_hex = get_mac_address()
-    vdc_id = mac_to_vdc_id(mac_hex)
+    vdc_id = DsUid.for_vdc(mac_hex)
     print(f"\nHost MAC: {mac_hex}")
     print(f"VDC dSUID: {vdc_id}\n")
-
-    zc, zc_info = await register_zeroconf(vdc_id, dss_port)
 
     vdc, sensor = build_vdc(vdc_id, dss_host, dss_port)
 
@@ -245,7 +192,6 @@ async def run() -> None:
             await vdc.start()
         except Exception as e:
             logger.error("Failed to start VDC: %s", e)
-            await unregister_zeroconf(zc, zc_info)
             sys.exit(1)
 
         print("VDC running. Temperature updates every 5 seconds.\n")
@@ -253,14 +199,13 @@ async def run() -> None:
         stop_temp = asyncio.Event()
         temp_task = asyncio.create_task(temperature_loop(sensor, stop_temp))
         menu_task = asyncio.create_task(
-            console_menu(vdc_id, dss_host, dss_port, vdc, sensor, zc, zc_info, stop_temp)
+            console_menu(vdc_id, dss_host, dss_port, vdc, stop_temp)
         )
 
         done, pending = await asyncio.wait(
             {temp_task, menu_task}, return_when=asyncio.FIRST_COMPLETED
         )
 
-        # Cancel the temperature loop if menu exited first
         for task in pending:
             task.cancel()
             try:
@@ -268,13 +213,11 @@ async def run() -> None:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Retrieve menu result
         result = menu_task.result() if menu_task in done else None
 
         if result is None or result[0] == "quit":
             break
 
-        # restart
         _action, vdc, sensor = result
         print("VDC restarted. Resuming temperature updates...\n")
 
