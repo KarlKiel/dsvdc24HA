@@ -20,5 +20,8 @@ dev = [
     "grpcio-tools>=1.50",
 ]
 
+[tool.setuptools.packages.find]
+include = ["pyDSvDCAPIv2*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
