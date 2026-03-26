@@ -7,7 +7,7 @@ name = "pyDSvDCAPIv2"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "protobuf>=4.0",
+    "protobuf>=6.0",
     "pyyaml>=6.0",
     "websockets>=11.0",
     "zeroconf>=0.80.0",
